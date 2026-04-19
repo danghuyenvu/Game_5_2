@@ -1,5 +1,7 @@
 from Deck import *
 import random
+import socket
+import pickle
 class Player:
     def __init__(self):
         self.temp = {
@@ -210,3 +212,21 @@ class RandomBot(Player):
             return chosen_noble
         
         return None
+
+
+class ClientPlayer(Player):
+    def __init__(self, client):
+        super().__init__()
+        self.client = client
+        self.server_ip = getattr(client, 'server_ip', None)
+        self.server_port = getattr(client, 'server_port', None)
+        self.socket = getattr(client, 'socket', None)
+
+    def send_action(self, action_data):
+        if self.client:
+            return self.client.send_action(action_data)
+        return False
+
+    def close_connection(self):
+        if self.client:
+            self.client.disconnect()

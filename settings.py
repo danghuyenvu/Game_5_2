@@ -9,6 +9,9 @@ GAME_NAME = "Peak Boardgame"
 WINDOW_RESOLUTION = (1024, 768)
 GAME_SCALE = 1
 FPS = 120
+ROOM_DIRECTORY_HOST = "127.0.0.1"
+ROOM_DIRECTORY_PORT = 12345
+DEFAULT_ROOM_PORT = 23456
 
 CARD_W, CARD_H = 100, 140  # Kích thước lá bài
 GAP = 20                   # Khoảng cách giữa các lá

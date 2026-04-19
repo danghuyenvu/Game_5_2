@@ -38,7 +38,6 @@ class Noble(Card):
             try:
                 image = pygame.image.load(self.dir).convert_alpha()
                 self.image = pygame.transform.smoothscale(image, (CARD_W, CARD_W))
-                print(f"Loaded noble image: {self.dir}, id {id(self)}")
             except Exception as e:
                 print(f"Error loading noble image {self.dir}: {e}")
 

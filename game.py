@@ -2,6 +2,7 @@ import pygame
 from concurrent.futures import ThreadPoolExecutor
 import threading
 import pickle
+import socket
 import os
 
 from pygame.locals import *
@@ -26,6 +27,14 @@ class Game():
         self.menu = Menu()
         self.start = False
         self.initialized = False
+
+        # Multiplayer
+        self.server = None
+        self.client = None
+        self.is_host = False
+        self.is_client = False
+        self.pending_network_actions = []
+        self.pending_network_lock = threading.Lock()
 
         self.running = True
         self.bot_thinking = False
@@ -92,6 +101,12 @@ class Game():
     def init_game(self, num_player = 2, bot=None):
         if not hasattr(self, 'font'):
             self.font = pygame.font.SysFont("Arial", 16, bold=True)
+        self.noble_rects = []
+        self.card_rects = [[], [], []]
+        self.cost_rects = []
+        self.gems_rect = []
+        self.action_button_rects = []
+        self.deposit_rects = []
         cards_by_level, self.cards, self.nobles = process_card_data()
         self.level1 = CardDeck(cards_by_level[1], 1)
         self.level2 = CardDeck(cards_by_level[2], 2)
@@ -202,7 +217,7 @@ class Game():
         # deposit rect
         for index in range(3):
             card_pos = (DEPOSIT_POS[0] + DEPOSIT_OFFSET * index, DEPOSIT_POS[1])
-            rect = card.image.get_rect(topleft=card_pos)
+            rect = pygame.Rect(card_pos[0], card_pos[1], CARD_W, CARD_H)
             self.deposit_rects.append(rect)
 
         self.save_game_state('initial_game.pkl')
@@ -313,36 +328,60 @@ class Game():
             'selected_gem': self.selected_gem,
         }
 
-    def save_initial_state(self):
-        """Save the initial game state for easy reset"""
+    def build_serializable_state(self):
         state = self.get_game_state_dict()
-        # Clear all pygame surfaces before pickling
         for obj in state.values():
             if isinstance(obj, list):
                 for item in obj:
                     self.clear_pygame_surfaces(item)
             else:
                 self.clear_pygame_surfaces(obj)
+        # Detach the snapshot from the live game objects before sprites are reloaded.
+        return pickle.loads(pickle.dumps(state))
+
+    def wait_for_sprite_reload(self):
+        if self.nobles:
+            for noble in self.nobles.nobles:
+                while noble.image is None:
+                    time.sleep(0.01)
+
+    def apply_loaded_state(self, state):
+        self.current_player = state['current_player']
+        self.num_player = state['num_player']
+        self.players = state['players']
+        self.board = state['board']
+        self.bank = state['bank']
+        self.nobles = state['nobles']
+        self.shown_nobles = state['shown_nobles']
+        self.level1 = state['level1']
+        self.level2 = state['level2']
+        self.level3 = state['level3']
+        self.choosing_card = state['choosing_card']
+        self.choosing_cost = state['choosing_cost']
+        self.choosing_gems = state['choosing_gems']
+        self.choosing_nobles = state['choosing_nobles']
+        self.show_noble_overlay = state['show_noble_overlay']
+        self.current_action = state['current_action']
+        self.selected_gems = state['selected_gems']
+        self.selected_gem = state['selected_gem']
+
+        self.reload_sprites()
+        self.wait_for_sprite_reload()
+
+    def save_initial_state(self):
+        """Save the initial game state for easy reset"""
+        state = self.build_serializable_state()
         filepath = os.path.join(self.save_dir, 'initial_game.pkl')
         with open(filepath, 'wb') as f:
             pickle.dump(state, f)
         print(f"Initial game state saved to {filepath}")
         # Reload sprites after saving so game can continue displaying
         self.reload_sprites()
-        for noble in self.nobles.nobles:
-            while noble.image is None:
-                time.sleep(0.01)
+        self.wait_for_sprite_reload()
 
     def save_game_state(self, filename='current_game.pkl'):
         """Save current game state"""
-        state = self.get_game_state_dict()
-        # Clear all pygame surfaces before pickling
-        for obj in state.values():
-            if isinstance(obj, list):
-                for item in obj:
-                    self.clear_pygame_surfaces(item)
-            else:
-                self.clear_pygame_surfaces(obj)
+        state = self.build_serializable_state()
         filepath = os.path.join(self.save_dir, filename)
         with open(filepath, 'wb') as f:
             pickle.dump(state, f)
@@ -358,35 +397,7 @@ class Game():
         try:
             with open(filepath, 'rb') as f:
                 state = pickle.load(f)
-            
-            # Restore game state
-            self.current_player = state['current_player']
-            self.num_player = state['num_player']
-            self.players = state['players']
-            self.board = state['board']
-            self.bank = state['bank']
-            self.nobles = state['nobles']
-            self.shown_nobles = state['shown_nobles']
-            self.level1 = state['level1']
-            self.level2 = state['level2']
-            self.level3 = state['level3']
-            self.choosing_card = state['choosing_card']
-            self.choosing_cost = state['choosing_cost']
-            self.choosing_gems = state['choosing_gems']
-            self.choosing_nobles = state['choosing_nobles']
-            self.show_noble_overlay = state['show_noble_overlay']
-            self.current_action = state['current_action']
-            self.selected_gems = state['selected_gems']
-            self.selected_gem = state['selected_gem']
-            
-            # Reload all pygame sprites that were cleared during save
-            self.reload_sprites()
-            
-            # Wait for sprites to load
-            for noble in self.nobles.nobles:
-                while noble.image is None:
-                    time.sleep(0.01)
-            
+            self.apply_loaded_state(state)
             print(f"Game state loaded from {filepath}")
             return True
         except Exception as e:
@@ -396,22 +407,51 @@ class Game():
     def play(self):
         while self.running:
             self.handle_input()
+            self.process_network_actions()
             if not self.game_over:
                 self.handle_bot()
-                if len(self.choosing_nobles):
-                    for noble in self.shown_nobles:
-                        print(noble.resources)
             self.draw()
             self.update()
             self.clock.tick(FPS)
         
         pygame.quit()
 
+    def is_client_turn(self):
+        if not self.is_client or not self.client:
+            return True
+        return getattr(self.client, 'player_index', None) == self.current_player
+
+    def get_local_player_index(self):
+        if self.is_client and self.client:
+            player_index = getattr(self.client, 'player_index', None)
+            if player_index is not None and 0 <= player_index < len(self.players):
+                return player_index
+        if self.is_host and self.players:
+            return 0
+        return self.current_player
+
+    def is_multiplayer_session(self):
+        return self.is_host or self.is_client
+
+    def is_local_human_turn(self):
+        if self.is_client:
+            return self.is_client_turn()
+        if self.is_host:
+            return self.current_player == 0
+        return True
+
+    def ensure_card_image(self, card):
+        if card is None:
+            return None
+        if card.image is None and hasattr(card, "load"):
+            card.load()
+        return card.image
+
     def draw(self):
         # 1. Clear screen & Background
         self.screen.fill((30, 30, 30))
 
-        if not self.start:
+        if self.menu.in_menu or not self.start:
             self.menu.draw(self.screen)
             pygame.display.flip()
             return
@@ -482,7 +522,8 @@ class Game():
         pygame.draw.rect(self.screen, (40, 40, 40), action_rect)
         pygame.draw.rect(self.screen, (0, 255, 200), action_rect, 3)
 
-        current_p = self.players[self.current_player]
+        display_player_index = self.get_local_player_index()
+        current_p = self.players[display_player_index]
         gem_to_key = {"Onyx": "black", "Sapphire": "blue", "Emerald": "green", "Ruby": "red", "Diamond": "white", "Gold": "gold"}
         score_txt = self.font.render(f"YOUR SCORE: {current_p.point}", True, (255, 255, 0))
         self.screen.blit(score_txt, (20, action_rect.y + 5))
@@ -509,7 +550,12 @@ class Game():
             
         # Draw deposit cards
         for index, card in enumerate(current_p.deposit_card):
-            self.screen.blit(card.image, self.deposit_rects[index])
+            image = self.ensure_card_image(card)
+            if image is None:
+                pygame.draw.rect(self.screen, (80, 80, 80), self.deposit_rects[index])
+                pygame.draw.rect(self.screen, (255, 255, 255), self.deposit_rects[index], 2)
+                continue
+            self.screen.blit(image, self.deposit_rects[index])
             if self.choosing_card and card.is_same_card(self.choosing_card):
                 pygame.draw.rect(self.screen, (255, 255, 0), self.deposit_rects[index], 4)
 
@@ -552,7 +598,7 @@ class Game():
             pygame.draw.rect(self.screen, (150, 150, 150), s_rect)
             pygame.draw.rect(self.screen, (0, 0, 0), s_rect, 2)
 
-        others = [ (idx, p) for idx, p in enumerate(self.players) if idx != self.current_player ]
+        others = [ (idx, p) for idx, p in enumerate(self.players) if idx != display_player_index ]
         
         for i, (idx, p_other) in enumerate(others):
             # Vẽ từng ô từ trên xuống dưới
@@ -603,9 +649,10 @@ class Game():
                 start_y = s_rect.y + 140  # Below the gem display area
                 
                 for card_idx, card in enumerate(p_other.deposit_card):
-                    if card.image:
+                    image = self.ensure_card_image(card)
+                    if image:
                         # Scale down the card image
-                        scaled_card = pygame.transform.smoothscale(card.image, (small_card_w, small_card_h))
+                        scaled_card = pygame.transform.smoothscale(image, (small_card_w, small_card_h))
                         card_x = start_x + card_idx * (small_card_w + card_gap)
                         card_y = start_y
                         
@@ -643,6 +690,15 @@ class Game():
             text_rect = thinking_text.get_rect(center=(WINDOW_RESOLUTION[0] // 2, WINDOW_RESOLUTION[1] // 2))
             self.screen.blit(thinking_text, text_rect)
 
+        if (self.is_client or self.is_host) and not self.is_local_human_turn() and not self.game_over:
+            overlay = pygame.Surface(WINDOW_RESOLUTION, pygame.SRCALPHA)
+            overlay.fill((0, 0, 0, 140))
+            self.screen.blit(overlay, (0, 0))
+
+            waiting_text = self.font.render("Opponent is making move.", True, (255, 255, 255))
+            waiting_rect = waiting_text.get_rect(center=(WINDOW_RESOLUTION[0] // 2, WINDOW_RESOLUTION[1] // 2))
+            self.screen.blit(waiting_text, waiting_rect)
+
         if self.game_over:
             # Semi-transparent overlay
             overlay = pygame.Surface(WINDOW_RESOLUTION, pygame.SRCALPHA)
@@ -676,14 +732,8 @@ class Game():
         if self.menu.in_menu:
             self.menu.update()
             return
-        for level in [1,2,3]:
-            while len(self.board[level]) < 4:
-                card = getattr(self, f"level{level}").draw()
-                if card:
-                    self.board[level].append(card)
-                else:
-                    self.card_rects[level - 1].pop()
-                    break
+        if not self.is_client:
+            self.fill_board_slots()
 
         # move chosen deposit to last to blit
         cur = self.players[self.current_player]
@@ -693,6 +743,8 @@ class Game():
                 cur.deposit_card.append(chosen)
 
     def handle_bot(self):
+        if self.is_client:
+            return
         player = self.players[self.current_player]
         if isinstance(player, RandomBot):
             def bot_action():
@@ -707,16 +759,22 @@ class Game():
                 self.bot_thinking = True
                 threading.Thread(target=bot_action).start()
 
-
     def handle_input(self):
         for event in pygame.event.get():
             if self.menu.in_menu:
-                self.menu.has_saved_game = os.path.exists(os.path.join(self.save_dir, 'current_game.pkl'))
+                self.menu.has_saved_game = (
+                    not self.is_multiplayer_session()
+                    and os.path.exists(os.path.join(self.save_dir, 'current_game.pkl'))
+                )
                 if self.menu.handle_input(event):
                     if self.menu.selected_option == "Continue":
                         # Only load saved game if in main menu (state == 0)
                         # If in pause menu (state == 1), just resume
-                        if self.menu.state == 0 and os.path.exists(os.path.join(self.save_dir, 'current_game.pkl')):
+                        if (
+                            not self.is_multiplayer_session()
+                            and self.menu.state == 0
+                            and os.path.exists(os.path.join(self.save_dir, 'current_game.pkl'))
+                        ):
                             self.load_game_state('current_game.pkl')
                             self.initialized = True
                         self.menu.selected_option = None
@@ -725,14 +783,67 @@ class Game():
                             self.init_players(num_players = self.menu.current_num_players)
                             self.initialized = True
                         self.menu.selected_option = None
+                    elif self.menu.selected_option == "Host":
+                        self.start_server()
+                        # Go to waiting state instead of starting game immediately
+                        self.menu.waiting_for_players = True
+                        self.menu.waiting_is_host = True
+                        self.menu.hosting = False
+                        self.menu.connected_players = 1  # Host counts as 1 player
+                        self.menu.selected_option = None
+                    elif self.menu.selected_option == "Start Multiplayer Game":
+                        if not self.initialized:
+                            self.init_game(num_player = self.menu.current_num_players)
+                            self.configure_multiplayer_players()
+                            self.initialized = True
+
+                        # Start the multiplayer session now. Fill missing slots with chosen bots.
+                        if self.server:
+                            self.server.send_initial_state(self.build_initial_state())
+                        self.menu.waiting_for_players = False
+                        self.menu.in_menu = False
+                        self.menu.hosting = False
+                        self.menu.selected_option = None
+                    elif self.menu.selected_option == "Quit Hosting":
+                        # Stop the server and return to main menu
+                        if hasattr(self, 'server') and self.server:
+                            self.server.stop()
+                            self.server = None
+                        self.is_host = False
+                        self.menu.waiting_for_players = False
+                        self.menu.waiting_is_host = True
+                        self.menu.in_menu = True
+                        self.menu.state = 0
+                        self.menu.selected_option = None
+                    elif self.menu.selected_option == "Leave Waiting Room":
+                        if self.client:
+                            self.client.disconnect()
+                            self.client = None
+                        self.is_client = False
+                        self.menu.waiting_for_players = False
+                        self.menu.waiting_is_host = True
+                        self.menu.in_menu = True
+                        self.menu.state = 0
+                        self.menu.selected_option = None
+                    elif self.menu.selected_option == "Join":
+                        # Get the selected server address from menu
+                        if self.menu.selected_server:
+                            if not self.join_server(self.menu.selected_server):
+                                print("Failed to join server")
+                        self.menu.selected_option = None
+                    elif self.menu.selected_option == "Refresh Rooms":
+                        self.refresh_available_rooms()
+                        self.menu.selected_option = None
                     elif self.menu.selected_option == "Main Menu":
                         self.initialized = False
-                        self.save_game_state('current_game.pkl')
+                        if not self.is_multiplayer_session():
+                            self.save_game_state('current_game.pkl')
                         self.menu.selected_option = None
                     self.start = True
                 continue
             if event.type == pygame.QUIT:
-                self.save_game_state('current_game.pkl')
+                if not self.is_multiplayer_session():
+                    self.save_game_state('current_game.pkl')
                 self.running = False
                 return
             if self.game_over:
@@ -750,6 +861,8 @@ class Game():
                     continue
 
             player = self.players[self.current_player]
+            if (self.is_client or self.is_host) and not self.is_local_human_turn():
+                continue
             if isinstance(player, RandomBot):
                 return
             if event.type == pygame.MOUSEBUTTONDOWN:
@@ -775,6 +888,7 @@ class Game():
                             self.noble_chosen_this_frame = True  # Prevent re-checking nobles this frame
                             # End the turn after choosing a noble
                             self.next_turn()
+                            self.broadcast_multiplayer_state()
                             # reset everything
                             self.current_action = None
                             self.selected_gems = []
@@ -850,7 +964,10 @@ class Game():
                 # ===== CONFIRM =====
                 if self.current_action and hasattr(self, "confirm_rect") and self.confirm_rect.collidepoint(pos):
                     if self.can_confirm():
-                        self.execute_action()
+                        if self.is_client:
+                            self.submit_client_action()
+                        else:
+                            self.execute_action()
                         # self.next_turn()
 
     def next_turn(self):
@@ -935,6 +1052,15 @@ class Game():
                 if card.is_same_card(target):
                     self.board[level].pop(i)
                     return
+
+    def fill_board_slots(self):
+        for level in [1, 2, 3]:
+            while len(self.board[level]) < 4:
+                card = getattr(self, f"level{level}").draw()
+                if card:
+                    self.board[level].append(card)
+                else:
+                    break
                    
     def execute_action(self):
         player = self.players[self.current_player]
@@ -1028,6 +1154,11 @@ class Game():
                     keys = ["black","blue","green","red","white"]
                     player.temp[keys[player.selected_gems]] += 2
 
+        # The host/offline game must draw replacement board cards immediately.
+        # Clients should only ever receive those cards from the host.
+        if not self.is_client:
+            self.fill_board_slots()
+
         # reset everything
         self.current_action = None
         self.selected_gems = []
@@ -1050,6 +1181,10 @@ class Game():
                 # new_noble = self.nobles.draw()
                 # if new_noble:
                 #     self.shown_nobles.append(new_noble)
+        elif self.is_host or self.is_client:
+            if available_nobles:
+                cur.add_noble(available_nobles[0])
+                self.shown_nobles.remove(available_nobles[0])
         else:
             # Human players: show overlay if multiple nobles available
             if len(available_nobles) > 1:
@@ -1068,6 +1203,344 @@ class Game():
 
         # ===== END TURN =====
         self.next_turn()
+        self.broadcast_multiplayer_state()
+
+    def start_server(self):
+        """Start the game server for hosting multiplayer games"""
+        from server import GameServer
+        self.is_host = True
+        self.is_client = False
+        
+        # Callback to update connected players count in menu
+        def update_player_count(count):
+            self.menu.connected_players = count
+
+        def handle_remote_action(player_index, payload):
+            return self.handle_network_action(player_index, payload)
+        
+        self.server = GameServer(
+            port=DEFAULT_ROOM_PORT,
+            player_count_callback=update_player_count,
+            room_name=self.menu.host_room_name or "Unnamed",
+            max_players=self.menu.current_num_players,
+            action_callback=handle_remote_action,
+            directory_host=ROOM_DIRECTORY_HOST,
+            directory_port=ROOM_DIRECTORY_PORT,
+        )
+        # Start server in a separate thread
+        import threading
+        server_thread = threading.Thread(target=self.server.start)
+        server_thread.daemon = True
+        server_thread.start()
+        print("Server started")
+        self.refresh_available_rooms()
+
+    def join_server(self, server_addr):
+        """Connect to a multiplayer game server"""
+        from client import GameClient
+        self.is_client = True
+        self.is_host = False
+        ip, port = server_addr.split(':')
+        port = int(port)
+        self.client = GameClient(
+            ip,
+            port,
+            room_name=self.menu.host_room_name,
+            state_callback=self.handle_initial_state,
+            room_status_callback=self.handle_room_status,
+        )
+        if self.client.connect():
+            if self.client.target_num_players is not None:
+                self.menu.current_num_players = self.client.target_num_players
+            self.menu.connected_players = self.client.connected_players
+            self.menu.host_room_name = self.client.room_name or self.menu.host_room_name
+            self.menu.waiting_for_players = True
+            self.menu.waiting_is_host = False
+            self.menu.in_menu = True
+            print("Connected to server")
+            return True
+        else:
+            print("Failed to connect to server")
+            return False
+
+    def refresh_available_rooms(self):
+        from client import fetch_available_rooms
+
+        self.menu.available_servers = fetch_available_rooms(ROOM_DIRECTORY_HOST, ROOM_DIRECTORY_PORT)
+
+    def handle_room_status(self, status):
+        self.menu.connected_players = status.get("connected_players", self.menu.connected_players)
+        self.menu.current_num_players = status.get("num_players", self.menu.current_num_players)
+        self.menu.host_room_name = status.get("room_name", self.menu.host_room_name)
+
+    def handle_initial_state(self, sync_mode, state):
+        if sync_mode == "initial":
+            self.apply_initial_state(state)
+        else:
+            self.apply_state_update(state)
+
+    def apply_initial_state(self, state):
+        self.num_player = state.get('num_player', state.get('num_players', self.menu.current_num_players))
+        if not self.initialized:
+            self.init_game(num_player=self.num_player)
+        self.apply_loaded_state(state)
+        self.menu.current_num_players = self.num_player
+        self.menu.host_room_name = self.client.room_name or self.menu.host_room_name
+
+        self.initialized = True
+        self.start = True
+        self.menu.in_menu = False
+        self.menu.waiting_for_players = False
+        self.menu.waiting_is_host = False
+
+    def card_key(self, card):
+        if card is None:
+            return None
+        if getattr(card, "dir", None):
+            return card.dir
+        return (
+            card.level,
+            card.color,
+            card.points,
+            tuple(card.resources),
+        )
+
+    def build_card_lookup(self):
+        lookup = {}
+
+        def register(card):
+            if card is None:
+                return
+            lookup[self.card_key(card)] = card
+
+        for level in [1, 2, 3]:
+            deck = getattr(self, f"level{level}", None)
+            if deck:
+                for card in deck.cards:
+                    register(card)
+            for card in self.board.get(level, []):
+                register(card)
+
+        if self.nobles:
+            for noble in self.nobles.nobles:
+                register(noble)
+        for noble in self.shown_nobles:
+            register(noble)
+
+        for player in self.players:
+            for card in player.cards:
+                register(card)
+            for card in player.deposit_card:
+                register(card)
+            for noble in player.noble:
+                register(noble)
+
+        return lookup
+
+    def resolve_card_keys(self, keys, lookup):
+        cards = []
+        for key in keys:
+            card = lookup.get(key)
+            if card is not None:
+                cards.append(card)
+        return cards
+
+    def build_player_sync(self):
+        return [
+            {
+                "point": player.point,
+                "temp": player.temp.copy(),
+                "perm": player.perm.copy(),
+                "cards": [self.card_key(card) for card in player.cards],
+                "deposit_card": [self.card_key(card) for card in player.deposit_card],
+                "noble": [self.card_key(card) for card in player.noble],
+            }
+            for player in self.players
+        ]
+
+    def build_state_update(self):
+        return {
+            "num_player": self.num_player,
+            "current_player": self.current_player,
+            "room_name": self.menu.host_room_name or "Unnamed",
+            "bank_gem": list(self.bank.gem),
+            "board": {
+                level: [self.card_key(card) for card in self.board[level]]
+                for level in [1, 2, 3]
+            },
+            "level_decks": {
+                1: [self.card_key(card) for card in self.level1.cards],
+                2: [self.card_key(card) for card in self.level2.cards],
+                3: [self.card_key(card) for card in self.level3.cards],
+            },
+            "shown_nobles": [self.card_key(card) for card in self.shown_nobles],
+            "nobles_deck": [self.card_key(card) for card in self.nobles.nobles] if self.nobles else [],
+            "players": self.build_player_sync(),
+            "game_over": self.game_over,
+            "winner_text": self.winner_text,
+        }
+
+    def apply_state_update(self, state):
+        if not self.initialized:
+            return
+
+        lookup = self.build_card_lookup()
+
+        self.num_player = state.get("num_player", self.num_player)
+        self.current_player = state.get("current_player", self.current_player)
+        self.menu.current_num_players = self.num_player
+        self.menu.host_room_name = state.get("room_name", self.menu.host_room_name)
+
+        if self.bank and "bank_gem" in state:
+            self.bank.gem = list(state["bank_gem"])
+
+        level_decks = state.get("level_decks", {})
+        for level in [1, 2, 3]:
+            deck = getattr(self, f"level{level}", None)
+            if deck and level in level_decks:
+                deck.cards = self.resolve_card_keys(level_decks[level], lookup)
+
+        board_state = state.get("board", {})
+        for level in [1, 2, 3]:
+            if level in board_state:
+                self.board[level] = self.resolve_card_keys(board_state[level], lookup)
+
+        if self.nobles and "nobles_deck" in state:
+            self.nobles.nobles = self.resolve_card_keys(state["nobles_deck"], lookup)
+        if "shown_nobles" in state:
+            self.shown_nobles = self.resolve_card_keys(state["shown_nobles"], lookup)
+
+        for player, player_state in zip(self.players, state.get("players", [])):
+            player.point = player_state.get("point", player.point)
+            player.temp = player_state.get("temp", player.temp)
+            player.perm = player_state.get("perm", player.perm)
+            player.cards = self.resolve_card_keys(player_state.get("cards", []), lookup)
+            player.deposit_card = self.resolve_card_keys(player_state.get("deposit_card", []), lookup)
+            player.noble = self.resolve_card_keys(player_state.get("noble", []), lookup)
+
+        self.game_over = state.get("game_over", self.game_over)
+        self.winner_text = state.get("winner_text", self.winner_text)
+        self.current_action = None
+        self.selected_gems = []
+        self.selected_gem = None
+        self.choosing_card = None
+        self.choosing_nobles = []
+        self.show_noble_overlay = False
+
+    def build_initial_state(self):
+        state = self.build_serializable_state()
+        state['room_name'] = self.menu.host_room_name or 'Unnamed'
+        self.reload_sprites()
+        self.wait_for_sprite_reload()
+        return state
+
+    def configure_multiplayer_players(self):
+        if not self.server:
+            return
+        connected_clients = self.server.connected_client_count()
+        for idx in range(1, min(self.num_player, connected_clients + 1)):
+            self.players[idx] = Player()
+
+    def broadcast_multiplayer_state(self):
+        if self.is_host and self.server and self.server.game_started:
+            self.server.broadcast_state(self.build_state_update())
+
+    def get_card_reference(self, card):
+        if card is None:
+            return None
+
+        for level in [1, 2, 3]:
+            for index, board_card in enumerate(self.board[level]):
+                if board_card.is_same_card(card):
+                    return {"source": "board", "level": level, "index": index}
+
+        current_player = self.players[self.current_player]
+        for index, deposit_card in enumerate(current_player.deposit_card):
+            if deposit_card.is_same_card(card):
+                return {"source": "deposit", "index": index}
+
+        return None
+
+    def resolve_card_reference(self, player_index, card_ref):
+        if not card_ref:
+            return None
+
+        source = card_ref.get("source")
+        if source == "board":
+            level = card_ref.get("level")
+            index = card_ref.get("index")
+            if level in self.board and isinstance(index, int) and 0 <= index < len(self.board[level]):
+                return self.board[level][index]
+        elif source == "deposit":
+            index = card_ref.get("index")
+            player = self.players[player_index]
+            if isinstance(index, int) and 0 <= index < len(player.deposit_card):
+                return player.deposit_card[index]
+        return None
+
+    def submit_client_action(self):
+        if not self.client:
+            return
+
+        payload = {
+            "current_action": self.current_action,
+            "selected_gems": list(self.selected_gems),
+            "selected_gem": self.selected_gem,
+            "card_ref": self.get_card_reference(self.choosing_card),
+        }
+        self.client.send_action(payload)
+        self.current_action = None
+        self.selected_gems = []
+        self.selected_gem = None
+        self.choosing_card = None
+
+    def handle_network_action(self, player_index, payload):
+        event = threading.Event()
+        request = {
+            "player_index": player_index,
+            "payload": payload,
+            "event": event,
+            "result": (False, "Action timed out"),
+        }
+        with self.pending_network_lock:
+            self.pending_network_actions.append(request)
+        event.wait(timeout=5.0)
+        return request["result"]
+
+    def process_network_actions(self):
+        if not self.is_host:
+            return
+
+        with self.pending_network_lock:
+            requests = list(self.pending_network_actions)
+            self.pending_network_actions.clear()
+
+        for request in requests:
+            request["result"] = self._apply_network_action(
+                request["player_index"],
+                request["payload"],
+            )
+            request["event"].set()
+
+    def _apply_network_action(self, player_index, payload):
+        if player_index != self.current_player:
+            return False, "It is not this player's turn"
+
+        action = payload.get("current_action")
+        self.current_action = action
+        self.selected_gems = payload.get("selected_gems", [])
+        self.selected_gem = payload.get("selected_gem")
+        self.choosing_card = self.resolve_card_reference(player_index, payload.get("card_ref"))
+
+        if not self.can_confirm():
+            self.current_action = None
+            self.selected_gems = []
+            self.selected_gem = None
+            self.choosing_card = None
+            return False, "Invalid action"
+
+        self.execute_action()
+        return True, None
 
     def init_players(self, num_players):
         self.num_player = num_players
